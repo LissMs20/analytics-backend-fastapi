@@ -44,31 +44,33 @@ MODEL_FILE = 'checklist_predictor_model.joblib'
 CLASSES_FILE = 'checklist_classes.json'
 # ---------------------------------------------
 
-# Variáveis globais para os modelos (Escopo do módulo)
-model_pipeline = None 
+model_pipeline_cache = {}
 TIPOS_DE_FALHA = [] 
 topic_pipeline = None 
 
-# --- FUNÇÕES DE CARREGAMENTO E CLASSIFICAÇÃO ---
-
-def carregar_modelos_ia():
-# ... [O restante da função carregar_modelos_ia() permanece inalterado] ...
-    """Carrega o modelo Scikit-learn e o Transformer do disco/HuggingFace."""
-    global model_pipeline, TIPOS_DE_FALHA, topic_pipeline
-    
-    # 1. Carregar Modelo Scikit-learn (Previsão de Falhas)
+@lru_cache(maxsize=1)
+def get_ml_model():
+    """Carrega o modelo Scikit-learn, uma única vez na primeira chamada, e armazena em cache."""
+    global TIPOS_DE_FALHA
     if os.path.exists(MODEL_FILE):
         try:
-            model_pipeline = joblib.load(MODEL_FILE)
+            model = joblib.load(MODEL_FILE)
             with open(CLASSES_FILE, 'r') as f:
-                TIPOS_DE_FALHA = json.load(f)
-            logger.info(f"[IA] Modelo de Checklist Scikit-learn carregado. Classes: {len(TIPOS_DE_FALHA)}")
+                # O TIPOS_DE_FALHA é carregado na primeira chamada
+                TIPOS_DE_FALHA = json.load(f) 
+            logger.info(f"[IA] Modelo Scikit-learn carregado LAZY. Classes: {len(TIPOS_DE_FALHA)}")
+            return model
         except Exception as e:
-            logger.error(f"[IA] ERRO ao carregar Scikit-learn: {e}. Execute 'python train_models.py'.")
-            model_pipeline = None
-    else:
-        logger.warning("[IA] AVISO: Modelo Scikit-learn não encontrado. Execute o script de treino.")
+            logger.error(f"[IA] ERRO ao carregar Scikit-learn: {e}.")
+            return None
+    logger.warning("[IA] AVISO: Modelo Scikit-learn não encontrado. Retornando None.")
+    return None
 
+# --- FUNÇÃO MODIFICADA: Apenas carrega o NLP (Se o NLP não causar falha) ---
+def carregar_modelos_ia_nlp_only():
+    """Carrega APENAS o Transformer NLP, se houver."""
+    global topic_pipeline
+    
     # 2. Carregar Modelo Transformer (Classificação de Tópico)
     if HAS_NLP:
         try:
@@ -85,7 +87,7 @@ def carregar_modelos_ia():
 
 @lru_cache(maxsize=128)
 def classificar_observacao_topico(text: str) -> str:
-# ... [A função classificar_observacao_topico() permanece inalterada] ...
+# ... (A função classificar_observacao_topico() permanece inalterada, depende de topic_pipeline) ...
     """Classifica o tópico de uma observação usando o Transformer."""
     global topic_pipeline
     
@@ -100,15 +102,14 @@ def classificar_observacao_topico(text: str) -> str:
         return "N/A - Texto Curto/Modelo Indisponível"
 
     try:
-        # Garante que o texto não seja muito longo para o modelo (truncamento implícito ou explícito)
         result = topic_pipeline(text, TOPIC_LABELS, multi_label=False)
         return result.get('labels', ['N/A - Inferência Falhou'])[0]
     except Exception as e:
         logger.warning(f"[IA] Falha na inferência NLP: {e}")
         return "ERRO - Inferência"
 
-# Carrega os modelos na inicialização do módulo
-carregar_modelos_ia()
+# 🚨 CHAME APENAS O CARREGAMENTO DO NLP GLOBALMENTE 🚨
+carregar_modelos_ia_nlp_only() 
 
 
 # --- LÓGICA DO MODELO (ANÁLISE EM TEMPO REAL) ---
