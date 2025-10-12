@@ -1,0 +1,12 @@
+.DS_Store
+
+__pycache__/
+*.pyc
+
+venv/
+.venv/
+
+.env             # Contém a DATABASE_URL
+*.joblib         # O modelo treinado (checklist_predictor_model.joblib)
+sqlite_schema.sql # Arquivo de esquema do DB antigo (opcional, mas seguro ignorar)
+*.db             # Qualquer arquivo de banco de dados SQLite local

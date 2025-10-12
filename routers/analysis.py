@@ -1,0 +1,148 @@
+# routers/analysis.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import Dict, List, Any
+import pandas as pd
+import json
+import logging
+
+import schemas
+from models import DadoIA, RegistroProducao
+from database import get_db
+from auth import get_current_user
+import models 
+
+from services.api_handlers import processar_analise_checklist
+from services.analyst import handle_query_analysis
+
+router = APIRouter(tags=["Análise de IA"])
+logger = logging.getLogger(__name__)
+
+# --- Endpoint de Análise de Múltiplas Falhas ---
+@router.post("/multifalha", response_model=schemas.AnalysisResponse)
+def testar_analise_multifalha(
+    dados: schemas.ChecklistCreateMulti,
+    current_user: models.Usuario = Depends(get_current_user)
+):
+    """
+    Endpoint de teste para simular a análise de IA para múltiplas falhas. 
+    Usa a função de orquestração que chama a lógica de ML/NLP do ia_core.
+    """
+    try:
+        dados_dict = dados.model_dump(exclude={"falhas"})
+        falhas_lista = dados.falhas
+
+        # 1. ORQUESTRAÇÃO: Chama a função de processamento de checklist (que faz o resumo)
+        # O services/api_handlers.py deve ter a função processar_analise_checklist,
+        # que retorna a string JSON consolidada.
+        json_string = processar_analise_checklist(dados_dict, falhas_lista)
+        analise = json.loads(json_string)
+        
+        # 2. Mapeia o resultado para o schema AnalysisResponse
+        summary = analise.get("resumo_geral", "Análise concluída.")
+        
+        # Cria as Dicas com base nas análises individuais (se existirem)
+        tips = [
+            schemas.Tip(
+                # Usa os campos que a orquestração deve ter adicionado
+                title=f"Falha: {a.get('falha', 'N/A')} - {a.get('status', 'N/D')}", 
+                detail=a.get('mensagem', a.get('recomendacao', 'Detalhes na análise JSON.'))
+            )
+            for a in analise.get('analises_individuais', [])
+        ]
+        
+        # 3. Cria dados de visualização (para este endpoint de teste)
+        alert_count = sum(1 for a in analise.get('analises_individuais', []) if "ALERTA" in a.get('status', ''))
+        rule_count = sum(1 for a in analise.get('analises_individuais', []) if "Recomendação Encontrada" in a.get('status', ''))
+        
+        vis_data = {
+            "title": "Status da Análise por Falha",
+            "labels": ["Alertas/Risco (ML)", "Recomendação (Regra)"],
+            "datasets": [
+                {"label": "Contagem", "data": [alert_count, rule_count], "type": 'bar', "backgroundColor": ['#E53935', '#FB8C00']}
+            ]
+        }
+        
+        return schemas.AnalysisResponse(
+            query="Multi-Falha Teste Direto",
+            summary=summary,
+            tips=tips,
+            visualization_data=vis_data
+        )
+    except Exception as e:
+        logger.exception(f"Falha na análise multi-falha: {e}")
+        raise HTTPException(status_code=500, detail=f"Falha na análise multi-falha: {e}")
+
+# --- NOVO ENDPOINT DE ANÁLISE AVANÇADA DA IA (/analyze) ---
+@router.post("/analyze", response_model=schemas.AnalysisResponse)
+def analyze_data_endpoint(
+    analysis_query: schemas.AnalysisQuery,
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(get_current_user)
+):
+    """
+    Endpoint que recebe uma query do usuário, busca checklists, 
+    combina-os e usa a IA estatística/ML para gerar análise.
+    """
+    
+    # 1. Busca e Combina Dados (Lógica de Orquestração de Dados)
+    try:
+        checklists_db = db.query(DadoIA).filter(
+            DadoIA.status == 'COMPLETO',
+            DadoIA.data_finalizacao.isnot(None)
+        ).all()
+
+        producao_db = db.query(RegistroProducao).filter(
+            RegistroProducao.tipo_registro == 'D'
+        ).all()
+        
+        # Converte os objetos SQLAlchemy para dicionários com .__dict__
+        df_checklists = pd.DataFrame([c.__dict__ for c in checklists_db]) if checklists_db else pd.DataFrame()
+        df_producao = pd.DataFrame([r.__dict__ for r in producao_db]) if producao_db else pd.DataFrame()
+        
+        # Limpa chaves internas do SQLAlchemy
+        if not df_checklists.empty:
+            df_checklists = df_checklists.drop(columns=['_sa_instance_state'], errors='ignore')
+        if not df_producao.empty:
+            df_producao = df_producao.drop(columns=['_sa_instance_state'], errors='ignore')
+            
+        # ORQUESTRAÇÃO: Realiza a Junção
+        if not df_checklists.empty and not df_producao.empty:
+            # Ajusta a data para o merge
+            df_checklists['data_finalizacao_date'] = pd.to_datetime(df_checklists['data_finalizacao']).dt.date
+            df_producao['data_registro_date'] = pd.to_datetime(df_producao['data_registro']).dt.date
+            
+            # Merge (Left Join para manter todas as falhas, mesmo sem registro de produção correspondente)
+            df_merged = pd.merge(
+                df_checklists,
+                df_producao,
+                left_on="data_finalizacao_date",
+                right_on="data_registro_date",
+                how="left",
+                suffixes=('_falha', '_prod')
+            ).fillna({"quantidade_diaria": 0})
+            
+            # Renomeia/Cria a coluna 'quantidade_produzida' que o analyst.py espera
+            df_merged['quantidade_produzida'] = df_merged['quantidade_diaria']
+            df_merged['data_registro'] = df_merged['data_finalizacao']
+
+        elif not df_checklists.empty:
+            # Se só houver falhas, cria colunas de produção vazias
+            df_merged = df_checklists.copy()
+            df_merged['quantidade_produzida'] = 0
+            df_merged['data_registro'] = df_merged['data_finalizacao']
+        
+        else:
+            # Não há dados de falha
+            df_merged = pd.DataFrame() 
+
+        # 2. Chama a função de análise da IA
+        data_to_analyze: List[Dict] = df_merged.to_dict('records')
+        analysis_result = handle_query_analysis(analysis_query.query, data_to_analyze)
+
+        return analysis_result
+
+    except Exception as e:
+        logger.exception(f"Erro na orquestração de dados ou na análise da IA: {e}")
+        # Retorna uma HTTPException para que o cliente saiba que algo deu errado
+        raise HTTPException(status_code=500, detail=f"Falha na análise avançada de dados da IA: {e}")
