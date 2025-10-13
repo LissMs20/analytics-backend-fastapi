@@ -11,6 +11,9 @@ from functools import lru_cache
 # DADOS DE REFERÊNCIA (Domínio - Usados por IA e Análise)
 # ----------------------------------------------------
 
+# (As constantes PLACAS_TEMPO, PLACAS_PROTECAO_1, etc., e as funções clean_product_name, 
+# classify_product_line, CAUSA_RAIZ_MAP, extract_period_and_date, safe_json_load permanecem inalteradas)
+
 @lru_cache(maxsize=None)
 def clean_product_name(product: str) -> str:
     """Remove o código P0000 e excesso de espaços do nome da placa."""
@@ -213,7 +216,7 @@ def extract_period_and_date(query: str) -> Tuple[str, Optional[datetime], str]:
         try:
             # Garante que, se for apenas um mês, o ano seja o atual
             if re.match(r'^\b(janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b', date_str):
-                 date_str = f"{date_str} {datetime.now().year}"
+                date_str = f"{date_str} {datetime.now().year}"
 
             parsed_date = parse(date_str, fuzzy=True, dayfirst=True)
         except ParserError:
@@ -234,6 +237,27 @@ def safe_json_load(value: Any) -> Any:
             return value
     return value
 
+# ====================================================================================================
+# ✅ SOLUÇÃO IMPLEMENTADA: Função flatten_nested robusta para lidar com mini-Series e arrays aninhados
+# ====================================================================================================
+def flatten_nested(x):
+    """Garante que um valor aninhado (list, ndarray, Series, etc.) vire uma string simples."""
+    # Se for uma mini-Series (caso raro mas ocorre em merges/explodes)
+    if isinstance(x, pd.Series):
+        x = x.tolist()
+
+    # Se for lista, array ou lista de listas → achata e junta tudo em string
+    if isinstance(x, (list, np.ndarray)):
+        # np.ravel achata qualquer dimensão (ex: [[1, 2], [3]] vira [1, 2, 3])
+        return ' '.join(map(str, np.ravel(x)))
+
+    # Se for NaN ou None → retorna string vazia
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ''
+
+    # Caso geral → converte pra string simples
+    return str(x)
+# ====================================================================================================
 
 def flatten_multi_failure_data(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -293,7 +317,12 @@ def prepare_dataframe(data: List[Dict], flatten_multifalha: bool = True) -> pd.D
 
     # [PONTO 1] Garante índice limpo e único
     df = df.reset_index(drop=True)
-    df.index = pd.RangeIndex(len(df))  # força índice único
+    df.index = pd.RangeIndex(len(df))
+
+    # ====================================================================================================
+    # 💡 Dica extra implementada: Limpa colunas duplicadas para evitar mini-Series na origem do problema
+    # ====================================================================================================
+    df = df.loc[:, ~df.columns.duplicated()]
 
     # ----------------------------
     # Pré-processamento inicial
@@ -319,34 +348,64 @@ def prepare_dataframe(data: List[Dict], flatten_multifalha: bool = True) -> pd.D
         df = flatten_multi_failure_data(df)
         if df.empty:
             return df
-        
-        # Revalida o índice após o flatten
+
+        # 1) Indice e colunas limpas
         df = df.reset_index(drop=True)
+        df = df.loc[:, ~df.columns.duplicated()].copy()
         df.index = pd.RangeIndex(len(df))
 
-        print("Shape observacao_producao:", np.array(df.get('observacao_producao')).shape)
-        print("Shape observacao_assistencia:", np.array(df.get('observacao_assistencia')).shape)
+        print("Shape observacao_producao (raw):", np.array(df.get('observacao_producao')).shape if 'observacao_producao' in df.columns else None)
+        print("Shape observacao_assistencia (raw):", np.array(df.get('observacao_assistencia')).shape if 'observacao_assistencia' in df.columns else None)
+        print("COLUMNS after flatten:", df.columns)
 
-        def to_str_flat(series: pd.Series) -> pd.Series:
-            """Converte valores brutos (incluindo listas/arrays replicados) em strings simples."""
-            return series.apply(
-                lambda x: ' '.join(map(str, x)) if isinstance(x, (list, tuple, np.ndarray)) else str(x)
-            ).fillna('')
+        # 2) Função robusta para achatar valores aninhados (handling Series, list, ndarray, DataFrame)
+        def flatten_nested(x):
+            if isinstance(x, pd.Series):
+                # converte mini-Series em lista
+                x = x.tolist()
+            if isinstance(x, pd.DataFrame):
+                # concatena todas as células do DataFrame em uma string por linha
+                # (convertendo o df interno para lista de strings)
+                try:
+                    return ' '.join(map(str, np.ravel(x.values)))
+                except Exception:
+                    return str(x)
+            if isinstance(x, (list, tuple, np.ndarray)):
+                return ' '.join(map(str, np.ravel(x)))
+            if x is None or (isinstance(x, float) and pd.isna(x)):
+                return ''
+            return str(x)
 
-        # Agora, usamos to_str_flat diretamente, confiando que o índice está correto 
-        # após o reset_index que foi chamado logo antes do "Shape observacao..."
-        obs_prod = to_str_flat(df.get('observacao_producao', pd.Series('', index=df.index)))
-        obs_ass = to_str_flat(df.get('observacao_assistencia', pd.Series('', index=df.index)))
+        # 3) Garante que as colunas existam e sejam Series 1-D com strings
+        def get_col_as_str_series(name):
+            if name in df.columns:
+                s = df[name].apply(flatten_nested)
+            else:
+                s = pd.Series([''] * len(df), index=df.index)
+            # agora s pode ter índice próprio; transformamos em lista e alinhamos ao df
+            vals = list(s)
+            # Trunca ou completa para garantir mesmo length do df
+            if len(vals) > len(df):
+                vals = vals[:len(df)]
+            elif len(vals) < len(df):
+                vals = vals + [''] * (len(df) - len(vals))
+            return pd.Series(vals, index=df.index).astype(str)
 
-        # A soma de strings no Pandas é alinhada por índice (que deve ser idêntico e RangeIndex)
-        df['observacao_combinada'] = obs_prod + ' ' + obs_ass
-        # Garante que o DataFrame final tenha o tamanho correto
-        df = df.iloc[:len(df['observacao_combinada'])].reset_index(drop=True)
+        obs_prod = get_col_as_str_series('observacao_producao')
+        obs_ass  = get_col_as_str_series('observacao_assistencia')
+
+        print("DEBUG SHAPES pós-flatten:", len(obs_prod), len(obs_ass), len(df))
+
+        # 4) Finalmente, cria a coluna combinada de forma segura
+        df['observacao_combinada'] = (obs_prod.fillna('') + ' ' + obs_ass.fillna('')).str.strip()
+
+        # Garantia final: remover qualquer coluna duplicada residual e reset index
+        df = df.loc[:, ~df.columns.duplicated()].reset_index(drop=True)
 
     # ----------------------------
     # Features de Domínio 
     # ----------------------------
-    df['linha_produto'] = df.get('produto', '').fillna('').apply(classify_product_line)
+    df['linha_produto'] = df.get('produto', pd.Series('', index=df.index)).fillna('').apply(classify_product_line)
 
     if 'causa_raiz_processo' not in df.columns and 'falha' in df.columns:
         df['causa_raiz_processo'] = df['falha'].fillna('').apply(lambda x: CAUSA_RAIZ_MAP.get(x, 'Causa Indeterminada'))

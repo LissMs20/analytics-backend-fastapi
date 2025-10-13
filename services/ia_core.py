@@ -9,9 +9,8 @@ from typing import Dict, Any, List
 from datetime import datetime
 from functools import lru_cache
 
-# 🚨 CORREÇÃO: Remove a importação de LOGICA_MODELO_SIMULADO 
 # Importações de domínio do módulo de pré-processamento
-from .preprocessing import classify_product_line, CAUSA_RAIZ_MAP # LOGICA_MODELO_SIMULADO removida daqui
+from .preprocessing import classify_product_line, CAUSA_RAIZ_MAP 
 
 # Configuração de logger
 logger = logging.getLogger(__name__)
@@ -28,8 +27,7 @@ except ImportError:
     pipeline = None
     HAS_NLP = False
 
-# --- CONSTANTE DE LÓGICA DE REGRAS (Movida para cá) ---
-# 🚨 Definição da lógica que estava causando o erro de importação 🚨
+# --- CONSTANTE DE LÓGICA DE REGRAS ---
 LOGICA_MODELO_SIMULADO = {
     # (Falha, Setor): Recomendação
     ("QUEBRA DO PINO", "MONTAGEM MECÂNICA"): "Ajustar o torque da ferramenta pneumática (limite em 5Nm).",
@@ -44,24 +42,33 @@ MODEL_FILE = 'checklist_predictor_model.joblib'
 CLASSES_FILE = 'checklist_classes.json'
 # ---------------------------------------------
 
-model_pipeline_cache = {}
+# Variável global para o pipeline ML e classes
+ML_MODEL_PIPELINE = None # Variável global para armazenar o pipeline ML
 TIPOS_DE_FALHA = [] 
 topic_pipeline = None 
 
 @lru_cache(maxsize=1)
 def get_ml_model():
     """Carrega o modelo Scikit-learn, uma única vez na primeira chamada, e armazena em cache."""
-    global TIPOS_DE_FALHA
+    global TIPOS_DE_FALHA, ML_MODEL_PIPELINE # Garante que estamos modificando a global
+    
+    if ML_MODEL_PIPELINE is not None:
+        return ML_MODEL_PIPELINE # Retorna o cache se já estiver carregado
+
     if os.path.exists(MODEL_FILE):
         try:
             model = joblib.load(MODEL_FILE)
             with open(CLASSES_FILE, 'r') as f:
                 # O TIPOS_DE_FALHA é carregado na primeira chamada
                 TIPOS_DE_FALHA = json.load(f) 
+            
+            ML_MODEL_PIPELINE = model # 🚨 CORREÇÃO: Atribui o objeto carregado à global 🚨
+            
             logger.info(f"[IA] Modelo Scikit-learn carregado LAZY. Classes: {len(TIPOS_DE_FALHA)}")
-            return model
+            return ML_MODEL_PIPELINE
         except Exception as e:
             logger.error(f"[IA] ERRO ao carregar Scikit-learn: {e}.")
+            ML_MODEL_PIPELINE = None # Garante que o estado é None em caso de falha
             return None
     logger.warning("[IA] AVISO: Modelo Scikit-learn não encontrado. Retornando None.")
     return None
@@ -87,7 +94,6 @@ def carregar_modelos_ia_nlp_only():
 
 @lru_cache(maxsize=128)
 def classificar_observacao_topico(text: str) -> str:
-# ... (A função classificar_observacao_topico() permanece inalterada, depende de topic_pipeline) ...
     """Classifica o tópico de uma observação usando o Transformer."""
     global topic_pipeline
     
@@ -115,12 +121,13 @@ carregar_modelos_ia_nlp_only()
 # --- LÓGICA DO MODELO (ANÁLISE EM TEMPO REAL) ---
 
 def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
-# ... [O restante da função analisar_checklist() permanece inalterado] ...
     """
     Executa todas as análises de domínio, regras e ML/NLP para um único registro de falha.
     Retorna um dicionário com os resultados.
     """
-    global model_pipeline, TIPOS_DE_FALHA
+    # 🚨 CORREÇÃO: Chama get_ml_model() para carregar/obter o pipeline 🚨
+    model_pipeline = get_ml_model() 
+    global TIPOS_DE_FALHA
     
     # 1. Extração Segura de Features
     falha = dados_checklist.get('falha', '').strip()
@@ -174,8 +181,13 @@ def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
                 'localizacao_componente': [dados_checklist.get('localizacao_componente', '')], 
                 'lado_placa': [dados_checklist.get('lado_placa', '')]
             }
+            # Aqui, o DataFrame tem 1 LINHA
             df_predict = pd.DataFrame.from_dict(data_for_df)
             
+            # O erro Length of values (11) does not match length of index (9) NÃO DEVE ocorrer aqui 
+            # se o DataFrame (df_predict) tiver 1 linha e o pipeline estiver esperando apenas 1 linha.
+            # Se o erro persistir, o problema é na estrutura do 'model_pipeline' (e.g., um Transformer/Encoder)
+            # que está gerando mais ou menos colunas do que o estimador final espera.
             probabilities = model_pipeline.predict_proba(df_predict)[0]
             predicted_index = np.argmax(probabilities)
             predicted_falha = TIPOS_DE_FALHA[predicted_index]
@@ -204,7 +216,6 @@ def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def analisar_checklist_multifalha(lista_de_falhas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-# ... [O restante da função analisar_checklist_multifalha() permanece inalterado] ...
     """
     Executa a análise de IA para uma lista de falhas (como em 'falhas_json').
     
@@ -219,10 +230,6 @@ def analisar_checklist_multifalha(lista_de_falhas: List[Dict[str, Any]]) -> List
     for i, falha_data in enumerate(lista_de_falhas):
         try:
             # Reutiliza a função de análise de falha única
-            # Presume que 'falha_data' contém as chaves 'falha', 'setor', etc.
-            # Nota: O produto e observação de nível superior devem estar presentes em 'falha_data'
-            # se estiver sendo chamado diretamente após um 'flatten'. Se for apenas a lista 
-            # aninhada, as chaves de produto/observacao podem estar ausentes e resultar em N/A.
             resultado_analise = analisar_checklist(falha_data)
             
             # Adiciona o índice original para rastreamento
