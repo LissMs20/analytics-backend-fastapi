@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
-
 import schemas
 import auth
 from database import get_db
@@ -13,10 +12,6 @@ from database import get_db
 router = APIRouter(
     tags=["Autenticação"]
 )
-
-# ----------------------------------------------------
-# ROTA DE LOGIN (/token) - O PONTO QUE CAUSAVA O ResponseValidationError
-# ----------------------------------------------------
 
 @router.post("/token", response_model=schemas.Token)
 async def login_for_access_token(

@@ -13,14 +13,10 @@ from database import get_db
 # Configurações JWT
 SECRET_KEY = "lPhbCcmq8ISPCZ3szUjngylt5PXiwqHVIuesrySbIUo"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 720  # 12 horas
+ACCESS_TOKEN_EXPIRE_MINUTES = 720
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")  # ✅ Ajustado
-
-# ---------------------------
-# Funções básicas
-# ---------------------------
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -37,19 +33,11 @@ def authenticate_user(db: Session, username: str, password: str):
         return None
     return user
 
-# ---------------------------
-# JWT
-# ---------------------------
-
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-# ---------------------------
-# Dependências de segurança
-# ---------------------------
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
