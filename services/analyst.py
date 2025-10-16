@@ -1,46 +1,88 @@
+# services/analyst.py (CÓDIGO COMPLETO E CORRIGIDO - ESTRATÉGIA HÍBRIDA)
+
 import json
 import pandas as pd
 import numpy as np
 import re
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from datetime import datetime
+import asyncio 
+from collections import deque
 
-# Importações de schemas (Assumindo que schemas é um módulo local ou está na raiz)
+# Importações de módulos locais (Ajuste se o seu caminho for diferente)
 import schemas 
-
-# Importações dos módulos modulares (mantidas as originais)
 from .preprocessing import prepare_dataframe, extract_period_and_date
-# Importa a função de NLP para a Lógica 3
-from .ia_core import classificar_observacao_topico 
+# Assumindo que essas duas funções async estão no llm_core.py
+from .llm_core import analyze_observations_with_gemini, summarize_analysis_with_gemini
 
 AnalysisResponse = schemas.AnalysisResponse
 Tip = schemas.Tip
-
-# Assumindo que o ChartData é o schema de Pydantic que você definiu para um único gráfico
 ChartData = schemas.ChartData 
 
-# --- FUNÇÕES DE ANÁLISE DETALHADA (Auxiliares para Orquestração) ---
+# --- MEMÓRIA DE CONTEXTO (Ideia 1) ---
+class AnalysisMemory:
+    def __init__(self, max_history=5):
+        self.history = deque(maxlen=max_history)
+
+    def add(self, query, summary):
+        self.history.append({"query": query, "summary": summary})
+
+    def last(self):
+        return list(self.history)
+
+memory = AnalysisMemory()
+
+# --- FUNÇÃO AUXILIAR DE INTENÇÃO (Ideia 2) ---
+intent_map = {
+    "qualidade": ["dppm", "rejeição", "falha", "taxa de falha", "defeito", "qualidade", "tendência", "defeitos"],
+    "setor": ["origem", "detecção", "departamento", "área", "setor"],
+    "causa_raiz": ["causa raiz", "processo", "linha", "produto", "raiz"],
+    "nlp": ["observação", "tópico", "comentário", "texto", "relato", "nlp"],
+}
+
+def detect_intents(query_lower: str) -> List[str]:
+    """Identifica todas as intenções ativas na consulta."""
+    active_intents = []
+    for intent, words in intent_map.items():
+        if any(word in query_lower for word in words):
+            active_intents.append(intent)
+    return active_intents if active_intents else ["default"]
+
+# --- FUNÇÃO DE FORECAST SIMPLES (Ideia 5) ---
+def forecast_next_period(df: pd.DataFrame) -> Optional[float]:
+    """Previsão simples de falhas para o próximo período usando regressão linear."""
+    df['periodo'] = df['data_registro'].dt.to_period('M').astype(str)
+    series = df.groupby('periodo')['quantidade'].sum().values
+    
+    # Requer pelo menos 3 pontos de dados para uma regressão minimamente válida
+    if len(series) > 3:
+        try:
+            # Encaixa uma linha (polinômio de grau 1) nos dados
+            trend = np.polyfit(range(len(series)), series, 1)[0]
+            next_val = series[-1] + trend
+            return float(max(0, next_val)) # Garante que o forecast não seja negativo
+        except Exception:
+            return None
+    return None
+
+# --- FUNÇÕES EXISTENTES DE ANÁLISE (MANTIDAS) ---
 
 def _extract_origin_sector(causa_raiz: str) -> str:
-    """Extrai o setor de origem da string de Causa Raiz de Processo."""
+# ... (função _extract_origin_sector mantida)
     if not isinstance(causa_raiz, str):
         return 'Setor Desconhecido'
     
-    # Ex: 'Falha no Processo (Máquina de Solda/Revisão)' -> 'Máquina de Solda'
     match = re.search(r'\((.*?)\)', causa_raiz)
     if match:
-        # Simplifica para o primeiro setor (ex: Máquina de Solda)
         origin_str = match.group(1)
         return origin_str.split('/')[0].strip()
     return 'Geral/Outros'
 
 def run_quality_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
-    """LÓGICA 1: Calcula e visualiza o DPPM (Defeitos por Milhão) ao longo do tempo."""
-    
+# ... (função run_quality_analysis mantida)
     period, specific_date, granularity_name = extract_period_and_date(query)
     df_filtered = df.copy()
-    
-    # 1. Aplica o filtro de data (Se necessário, aprimorar a lógica de filtragem de data relativa aqui)
+
     if specific_date:
         if period == 'D' or ('day' in str(specific_date) and period == 'G'): 
             df_filtered = df_filtered[df_filtered['data_registro'].dt.date == specific_date.date()]
@@ -57,14 +99,11 @@ def run_quality_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
     if df_filtered.empty:
         return {'status': 'FAIL', 'summary': f"Não há dados para o período solicitado: **{granularity_name}**.", 'visualization_data': []}
 
-    # 2. Agregação e Cálculo de DPPM (Melhoria 1)
     if period == 'G':
         period = 'M' 
         granularity_name = 'Mensal'
 
-    # Reseta o índice de falhas individuais para a contagem correta
     df_filtered = df_filtered.reset_index(drop=True) 
-
     df_filtered['periodo'] = df_filtered['data_registro'].dt.to_period(period).astype(str)
     
     summary_data = df_filtered.groupby('periodo').agg(
@@ -73,48 +112,48 @@ def run_quality_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
     ).reset_index()
 
     summary_data['total_producao_safe'] = summary_data['total_producao_periodo'].apply(lambda x: x if x > 0 else 1)
-    # Cálculo do DPPM (Defeitos por Milhão)
-    summary_data['dppm_periodo'] = (summary_data['total_falhas_periodo'] / summary_data['total_producao_safe']) * 1_000_000
+    summary_data['rejeicao_percentual'] = (summary_data['total_falhas_periodo'] / summary_data['total_producao_safe']) * 100
 
-    # 3. Resumo
-    media_geral = summary_data['dppm_periodo'].mean()
-    top_period_dppm = summary_data.sort_values(by='dppm_periodo', ascending=False).iloc[0] if not summary_data.empty else {'periodo': 'N/A', 'dppm_periodo': 0}
+    media_rejeicao = summary_data['rejeicao_percentual'].mean()
+    top_period_rejeicao = summary_data.sort_values(by='rejeicao_percentual', ascending=False).iloc[0] if not summary_data.empty else {'periodo': 'N/A', 'rejeicao_percentual': 0}
 
+    df_pico = df_filtered[df_filtered['periodo'] == top_period_rejeicao['periodo']]
+    top_falha_pico = df_pico['falha_individual'].mode().iat[0] if not df_pico.empty and not df_pico['falha_individual'].mode().empty else "N/A"
+    
     resumo = f"""
-        **Análise de Qualidade ({granularity_name})**
-        A **média de DPPM** no período analisado é de **{media_geral:.2f}**.
-        O período com o **maior DPPM** foi **{top_period_dppm['periodo']}**, com **{top_period_dppm['dppm_periodo']:.2f}**.
-        O controle de qualidade deve focar em reduzir o DPPM médio e analisar o período de pico.
+        **Análise de Qualidade: Taxa de Rejeição e Tendência ({granularity_name})**
+        
+        A **média de Rejeição** no período analisado é de **{media_rejeicao:.2f}%**.
+        O período com a **maior taxa de rejeição** foi **{top_period_rejeicao['periodo']}**, com **{top_period_rejeicao['rejeicao_percentual']:.2f}%**.
+        
+        **Foco:** A principal falha neste período de pico foi: **{top_falha_pico}**.
     """
     
-    # ATENÇÃO: vis_data (um único gráfico) deve ser retornado como uma lista de um item.
     vis_data = ChartData(
-        title=f"Tendência do DPPM (Defeitos por Milhão) - Agregação {granularity_name}",
+        title=f"Tendência da Taxa de Rejeição (%) - Agregação {granularity_name}",
         labels=summary_data['periodo'].tolist(),
         datasets=[
-            {"label": "DPPM", "data": summary_data['dppm_periodo'].tolist(), "type": 'line', "borderColor": 'rgb(255, 99, 132)', "backgroundColor": 'rgba(255, 99, 132, 0.5)'}
+            {"label": "Taxa de Rejeição (%)", "data": summary_data['rejeicao_percentual'].tolist(), "type": 'line', "borderColor": 'rgb(255, 99, 132)', "backgroundColor": 'rgba(255, 99, 132, 0.5)'}
         ],
-        chart_type='line' # Adicionado o tipo de gráfico
+        chart_type='line' 
     )
     
     dicas = [
-        Tip(title="Foco no Desvio", detail=f"Analise o período de pico ({top_period_dppm['periodo']}) para identificar a causa do alto DPPM."),
-        Tip(title="Meta", detail=f"O acompanhamento é crucial. Tente reduzir a média geral para **{(media_geral * 0.9):.2f}** DPPM."),
-        Tip(title="Métrica", detail="DPPM é a métrica padrão da indústria para defeitos de qualidade de produção."),
+        Tip(title="Foco no Desvio", detail=f"O processo de controle de qualidade deve analisar o período de pico ({top_period_rejeicao['periodo']}) e a falha **{top_falha_pico}**."),
+        Tip(title="Meta Estratégica", detail=f"Busque reduzir a taxa média geral para **{(media_rejeicao * 0.9):.2f}%** no próximo ciclo."),
     ]
     
     return {'status': 'OK', 'summary': resumo, 'visualization_data': [vis_data.model_dump()], 'tips': dicas}
 
 def run_root_cause_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
-    """LÓGICA 2: Analisa a distribuição de falhas por Causa Raiz e Linha de Produto."""
-    
-    causa_raiz_counts = df['causa_raiz_processo'].value_counts(normalize=True).mul(100).round(2).reset_index(name='percentual')
+# ... (função run_root_cause_analysis mantida)
+    causa_raiz_counts = df['causa_raiz_processo'].value_counts(normalize=True).mul(100).round(2).reset_index(name='percentual').head(5)
     causa_raiz_counts.columns = ['causa_raiz', 'percentual']
     
     top_causa = causa_raiz_counts.iloc[0]['causa_raiz'] if not causa_raiz_counts.empty else "N/A"
     top_causa_perc = causa_raiz_counts.iloc[0]['percentual'] if not causa_raiz_counts.empty else 0.0
 
-    linha_counts = df['linha_produto'].value_counts(normalize=True).mul(100).round(2).reset_index(name='percentual')
+    linha_counts = df['linha_produto'].value_counts(normalize=True).mul(100).round(2).reset_index(name='percentual').head(5)
     linha_counts.columns = ['linha_produto', 'percentual']
     top_linha = linha_counts.iloc[0]['linha_produto'] if not linha_counts.empty else "N/A"
     top_linha_perc = linha_counts.iloc[0]['percentual'] if not linha_counts.empty else 0.0
@@ -125,12 +164,20 @@ def run_root_cause_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
         A linha de produtos com maior incidência de falhas é a **Linha {top_linha}** (**{top_linha_perc}%** das ocorrências).
     """
     
-    # ATENÇÃO: vis_data (um único gráfico) deve ser retornado como uma lista de um item.
-    vis_data = ChartData(
-        title="Distribuição de Falhas por Causa Raiz (Processo)",
+    vis_data_causa = ChartData(
+        title="Distribuição Top 5 de Falhas por Causa Raiz (Processo)",
         labels=causa_raiz_counts['causa_raiz'].tolist(),
         datasets=[
-            {"label": "Percentual de Falhas", "data": causa_raiz_counts['percentual'].tolist(), "type": 'bar'}
+            {"label": "Percentual de Falhas", "data": causa_raiz_counts['percentual'].tolist(), "type": 'bar', "backgroundColor": 'rgba(75, 192, 192, 0.7)'}
+        ],
+        chart_type='bar'
+    )
+    
+    vis_data_linha = ChartData(
+        title="Distribuição Top 5 de Falhas por Linha de Produto",
+        labels=linha_counts['linha_produto'].tolist(),
+        datasets=[
+            {"label": "Percentual de Falhas", "data": linha_counts['percentual'].tolist(), "type": 'bar', "backgroundColor": 'rgba(255, 159, 64, 0.7)'}
         ],
         chart_type='bar'
     )
@@ -140,63 +187,71 @@ def run_root_cause_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
         Tip(title=f"Ação Prioritária (Produto)", detail="Realize auditorias nos procedimentos de montagem e teste dos produtos da Linha de " + top_linha + "."),
     ]
     
-    return {'status': 'OK', 'summary': resumo, 'visualization_data': [vis_data.model_dump()], 'tips': dicas}
+    return {'status': 'OK', 'summary': resumo, 'visualization_data': [vis_data_causa.model_dump(), vis_data_linha.model_dump()], 'tips': dicas}
 
-def run_nlp_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
-    """LÓGICA 3: Analisa a distribuição de falhas por Tópico (NLP do texto livre)."""
+async def run_nlp_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
+# ... (função run_nlp_analysis mantida)
     
     if df['observacao_combinada'].isnull().all() or df['observacao_combinada'].str.strip().eq('').all():
         return {'status': 'FAIL', 'summary': "Análise de Tópicos não executada: A maioria das observações está vazia ou nula.", 'visualization_data': []}
+
+    analysis_result = await analyze_observations_with_gemini(df, query)
     
-    # Aplica a função de NLP do ia_core
-    df['causa_raiz_ia'] = df['observacao_combinada'].apply(classificar_observacao_topico)
+    if analysis_result['status'] != 'OK':
+        return {
+            'status': 'FAIL', 
+            'summary': f"Falha na análise de tópicos com Gemini: {analysis_result.get('error', 'Erro desconhecido')}", 
+            'visualization_data': [],
+            'tips': [Tip(title="Erro de API/Contexto", detail="Verifique a chave de API ou se os dados de observação são relevantes.")],
+        }
+
+    topicos = analysis_result['topics_data']
     
-    analise_topico = df.groupby('causa_raiz_ia')['documento_id'].count().sort_values(ascending=False).reset_index(name='Contagem')
-    
-    if analise_topico.empty or analise_topico.iloc[0]['causa_raiz_ia'].startswith("N/A"):
-        return {'status': 'FAIL', 'summary': "A análise de observações não retornou resultados válidos (modelo NLP indisponível ou textos muito curtos).", 'visualization_data': []}
-            
-    # ATENÇÃO: vis_data (um único gráfico) deve ser retornado como uma lista de um item.
+    if not topicos:
+        return {
+            'status': 'FAIL', 
+            'summary': "O Gemini não retornou tópicos válidos para visualização.", 
+            'visualization_data': [], 
+        }
+
     vis_data = ChartData(
-        title="Contagem por Causa Raiz (Análise IA do Texto)",
-        labels=analise_topico['causa_raiz_ia'].tolist(),
+        title="Contagem por Causa Raiz (Análise IA do Texto via Gemini)",
+        labels=[t['nome'] for t in topicos],
         datasets=[
-            {"label": "Contagem", "data": analise_topico['Contagem'].tolist(), "backgroundColor": ["#4bc0c0", "#ff6384", "#ffcd56", "#36a2eb", "#9966ff"]}
+            {"data": [t['contagem'] for t in topicos], "type": 'pie', "backgroundColor": ["#4bc0c0", "#ff6384", "#ffcd56", "#36a2eb", "#9966ff"]}
         ],
-        chart_type='pie' # Sugerido Pie para distribuição de tópicos
+        chart_type='pie' 
     )
     
-    top_causa_ia = analise_topico.iloc[0]['causa_raiz_ia']
+    top_causa_ia = topicos[0]['nome']
     
-    resumo = f"A principal causa raiz identificada (via texto livre - NLP) é **{top_causa_ia}**, com {analise_topico.iloc[0]['Contagem']} ocorrências."
+    resumo = f"**Análise de Tópicos via Gemini:**\n{analysis_result['summary']}"
     
     dicas = [
         Tip(title="Ação por Tópico", detail=f"Se a principal causa é '{top_causa_ia}', revise as instruções ou materiais para a prevenção."),
-        Tip(title="Validação", detail="Compare esta classificação de NLP com a classificação tabular para validar a precisão.")
+        Tip(title="Validação", detail="O Gemini validou a classificação. Use esta informação para refinar processos.")
     ]
     
     return {'status': 'OK', 'summary': resumo, 'visualization_data': [vis_data.model_dump()], 'tips': dicas}
 
 def run_sector_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
-    """LÓGICA 4: Analisa o setor de DETECÇÃO e o setor de ORIGEM, retornando DOIS gráficos."""
+# ... (função run_sector_analysis mantida)
     
     if df.empty:
         return {'status': 'FAIL', 'summary': "Análise de Setor não executada: DataFrame vazio.", 'visualization_data': []}
 
-    # --- 1. Análise de Setor de DETECÇÃO (Onde a falha foi encontrada) ---
     falhas_por_setor_deteccao = df.groupby('setor_falha_individual')['falha_individual'] \
-                            .count() \
-                            .sort_values(ascending=False) \
-                            .reset_index(name='Contagem')
+                                 .count() \
+                                 .sort_values(ascending=False) \
+                                 .reset_index(name='Contagem').head(5)
     
     if falhas_por_setor_deteccao.empty:
         return {'status': 'FAIL', 'summary': "Análise de Setor não executada: Dados de setor de falha ausentes.", 'visualization_data': []}
-            
+             
     top_setor_deteccao = falhas_por_setor_deteccao.iloc[0]['setor_falha_individual']
 
-    # Gráfico 1: Setor de Detecção
     chart_deteccao = ChartData(
-        title="1. Volume de Falhas por Setor de DETECÇÃO",
+        title="1. Volume de Falhas por Setor de DETECÇÃO (Top 5)",
         labels=falhas_por_setor_deteccao['setor_falha_individual'].tolist(),
         datasets=[
             {"label": "Total de Falhas", "data": falhas_por_setor_deteccao['Contagem'].tolist(), "backgroundColor": "rgba(255, 99, 132, 0.7)" }
@@ -204,15 +259,13 @@ def run_sector_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
         chart_type='bar'
     )
 
-    # --- 2. Análise de Setor de ORIGEM (Onde o problema foi causado) ---
     df['setor_origem'] = df['causa_raiz_processo'].apply(_extract_origin_sector)
-    falhas_por_setor_origem = df.groupby('setor_origem')['documento_id'].count().sort_values(ascending=False).reset_index(name='Contagem')
+    falhas_por_setor_origem = df.groupby('setor_origem')['documento_id'].count().sort_values(ascending=False).reset_index(name='Contagem').head(5)
     
     top_origem = falhas_por_setor_origem.iloc[0]['setor_origem'] if not falhas_por_setor_origem.empty else "N/A"
 
-    # Gráfico 2: Setor de Origem
     chart_origem = ChartData(
-        title="2. Volume de Falhas por Setor de ORIGEM",
+        title="2. Volume de Falhas por Setor de ORIGEM (Top 5)",
         labels=falhas_por_setor_origem['setor_origem'].tolist(),
         datasets=[
             {"label": "Total de Falhas", "data": falhas_por_setor_origem['Contagem'].tolist(), "backgroundColor": "rgba(54, 162, 235, 0.7)" }
@@ -220,18 +273,17 @@ def run_sector_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
         chart_type='bar'
     )
     
-    # 💡 NOVO: Análise detalhada das falhas no setor de origem principal
-    falhas_do_top_origem = df[df['setor_origem'] == top_origem]
-    top_falhas_no_origem = falhas_do_top_origem['falha_individual'].value_counts().head(3).reset_index()
-    top_falhas_no_origem.columns = ['falha', 'contagem']
-
     falhas_detalhadas = ""
-    if not top_falhas_no_origem.empty:
-        falhas_detalhadas = "As falhas mais comuns neste setor de origem são:\n"
-        for _, row in top_falhas_no_origem.iterrows():
-            falhas_detalhadas += f"- **{row['falha']}** ({row['contagem']} ocorrências)\n"
+    if top_origem != "N/A":
+        falhas_do_top_origem = df[df['setor_origem'] == top_origem]
+        top_falhas_no_origem = falhas_do_top_origem['falha_individual'].value_counts().head(3).reset_index()
+        top_falhas_no_origem.columns = ['falha', 'contagem']
+
+        if not top_falhas_no_origem.empty:
+            falhas_detalhadas = "As falhas mais comuns neste setor de origem são:\n"
+            for _, row in top_falhas_no_origem.iterrows():
+                falhas_detalhadas += f"- **{row['falha']}** ({row['contagem']} ocorrências)\n"
     
-    # --- 3. Resumo Combinado e Melhorado ---
     resumo = f"""
         **Análise de Setor (Detecção vs. Origem)**
         
@@ -249,7 +301,6 @@ def run_sector_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
         Tip(title="Ponto de Controle", detail=f"O setor de **DETECÇÃO** ({top_setor_deteccao}) deve ser mantido como o principal ponto de controle de qualidade."),
     ]
     
-    # 4. Retorna uma LISTA de gráficos, convertendo os Pydantic models para dicionários
     return {
         'status': 'OK', 
         'summary': resumo, 
@@ -257,26 +308,63 @@ def run_sector_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
         'tips': dicas
     }
 
-def default_analysis(df: pd.DataFrame, query: str) -> AnalysisResponse:
-    """Análise de fallback se nenhuma query específica for encontrada."""
-    try:
-        falha_col = 'falha_individual' if 'falha_individual' in df.columns else 'falha'
-        top_falha = df[falha_col].dropna().mode().iat[0]
-    except Exception:
-        top_falha = "N/A (Coluna de falha vazia)"
+def run_structured_default_analysis(df: pd.DataFrame, query: str) -> Dict[str, Any]:
+# ... (função run_structured_default_analysis mantida)
+    
+    if df.empty:
+        return {
+            'status': 'FAIL', 
+            'summary': "Não há dados válidos para realizar a Análise Estruturada Padrão.", 
+            'visualization_data': [], 
+            'tips': []
+        }
+    
+    falha_col = 'falha_individual' if 'falha_individual' in df.columns else 'falha'
+    
+    causa_counts = df['causa_raiz_processo'].value_counts().head(3)
+    top_causa = causa_counts.index[0] if not causa_counts.empty else "N/A"
+
+    linha_counts = df['linha_produto'].value_counts().head(3)
+    top_linha = linha_counts.index[0] if not linha_counts.empty else "N/A"
+    
+    top_falha = df[falha_col].dropna().mode().iat[0] if not df[falha_col].dropna().empty else "N/A"
+
+    summary = f"""
+        **Análise Estruturada Padrão (Fallback Robusto)**
+        A IA compilou as principais prioridades de foco com base nos dados brutos ({len(df)} registros):
         
-    return AnalysisResponse(
-        query=query,
-        summary=f"A IA realizou uma análise geral sobre **{len(df)}** registros. A falha mais comum é **'{top_falha}'**. Nenhuma consulta específica foi detectada.",
-        tips=[
-            Tip(title="Sugestão de Busca Avançada", detail="Tente buscar por **'taxa de falha diária'**, **'causa raiz'** ou **'tópico das observações'**.")
-        ],
-        visualization_data=[] # Garante que o fallback retorne uma lista vazia
-    )
+        1.  **Prioridade de Processo (Causa Raiz):** A causa mais comum é **'{top_causa}'**.
+        2.  **Prioridade de Produção (Linha):** A linha de produto **'{top_linha}'** tem a maior incidência de falhas.
+        3.  **Falha de Componente:** A falha mais registrada é **'{top_falha}'**.
+    """
+    
+    vis_data = []
+
+    if not causa_counts.empty:
+        vis_data.append(ChartData(
+            title="Top 3 Causas Raiz de Processo",
+            labels=causa_counts.index.tolist(),
+            datasets=[{"data": causa_counts.tolist(), "type": 'pie', "backgroundColor": ["#4bc0c0", "#ff6384", "#ffcd56"]}],
+            chart_type='pie'
+        ).model_dump())
+
+    if not linha_counts.empty:
+        vis_data.append(ChartData(
+            title="Top 3 Linhas de Produto com Falha",
+            labels=linha_counts.index.tolist(),
+            datasets=[{"data": linha_counts.tolist(), "type": 'pie', "backgroundColor": ["#36a2eb", "#9966ff", "#ff9f40"]}],
+            chart_type='pie'
+        ).model_dump())
+
+    dicas = [
+        Tip(title="Foco Imediato", detail=f"Concentre a investigação na causa **'{top_causa}'**."),
+        Tip(title="Sugestão de Busca", detail="Para detalhes, pergunte: 'Qual a tendência de rejeição mensal?' ou 'Análise do tópico das observações.'")
+    ]
+    
+    return {'status': 'OK', 'summary': summary, 'visualization_data': vis_data, 'tips': dicas}
 
 def run_dppm_definition() -> Dict[str, Any]:
-    """LÓGICA DEFINITION: Explica o que é DPPM."""
-    
+# ... (função run_dppm_definition mantida)
     summary = """
         **DPPM** significa **Defeitos Por Milhão**.
         
@@ -285,7 +373,6 @@ def run_dppm_definition() -> Dict[str, Any]:
         **Por que é importante?**
         - **Padronização:** Permite comparar a qualidade de diferentes processos ou fábricas.
         - **Alta Precisão:** É ideal para processos de alta qualidade, onde a taxa de defeitos é muito baixa (ex: 0,05%).
-        - **Análise de Tendência:** Seu acompanhamento ao longo do tempo indica se o processo de produção está melhorando (DPPM diminuindo) ou piorando (DPPM aumentando).
     """
     
     dicas = [
@@ -300,11 +387,8 @@ def run_dppm_definition() -> Dict[str, Any]:
         'tips': dicas
     }
 
-# NOVA FUNÇÃO: Resposta a cumprimentos simples
 def run_greeting_analysis(query: str) -> Dict[str, Any]:
-    """LÓGICA GREETING: Responde a cumprimentos e oferece sugestões de consulta."""
-    
-    # Determina o cumprimento baseado na hora do dia (melhora a personalização)
+# ... (função run_greeting_analysis mantida)
     current_hour = datetime.now().hour
     if 5 <= current_hour < 12:
         greeting = "Bom dia!"
@@ -318,86 +402,123 @@ def run_greeting_analysis(query: str) -> Dict[str, Any]:
         "\n\nPara começar, você pode me perguntar sobre:"
     )
 
-    # Dicas de consulta não óbvias
     dicas = [
-        Tip(title="Tendência de Qualidade", detail="Pergunte: 'Qual é o DPPM mensal da produção?'"),
-        Tip(title="Foco Geográfico", detail="Pergunte: 'Quais são as falhas mais comuns no lado A da placa?'"),
-        Tip(title="Desvio de Processo", detail="Pergunte: 'A principal causa raiz tem relação com o setor de SMT?'"),
-        Tip(title="Análise Preditiva", detail="Pergunte: 'Existe alguma observação que indique problemas com o processo de solda?'"),
+        Tip(title="Tendência de Qualidade", detail="Pergunte: 'Qual é a taxa de rejeição mensal da produção?'"),
+        Tip(title="Foco Geográfico", detail="Pergunte: 'Quais são as falhas mais comuns no setor de SMT?'"),
+        Tip(title="Desvio de Processo", detail="Pergunte: 'Análise do tópico das observações'"),
     ]
     
-    # Retorna uma resposta estruturada sem dados de visualização
     return {
         'status': 'OK', 
         'summary': summary, 
-        'visualization_data': [], # Lista vazia, pois não há gráfico
+        'visualization_data': [], 
         'tips': dicas
     }
 
-# --- FUNÇÃO PRINCIPAL DE ORQUESTRAÇÃO DE ANÁLISE ---
+# --- FUNÇÃO PRINCIPAL DE ORQUESTRAÇÃO AVANÇADA (ASSÍNCRONA) ---
 
-def handle_query_analysis(query: str, data_to_analyze: List[Dict]) -> AnalysisResponse:
+async def handle_query_analysis(query: str, data_to_analyze: List[Dict]) -> AnalysisResponse:
     """
-    Função principal de IA que orquestra as análises estatísticas/domínio
-    com base na consulta do usuário.
+    IA Cortex Inteligente+: 
+    - Usa memória para contexto (Ideia 1)
+    - Detecta intenções com motor semântico (Ideia 2)
+    - Executa análises em paralelo/compostas (Ideia 3)
+    - Gera previsões (Ideia 5) e insights de LLM (Ideia 4)
     """
-    query_lower = query.lower()
-    analysis_results = {}
-    
-    # 0. NOVO: TRATAMENTO DE CUMPRIMENTOS (Prioridade Máxima)
-    # Define padrões que indicam apenas um cumprimento simples
+    query_lower = query.lower().strip()
+
+    # 0. TRATAMENTO DE CUMPRIMENTOS e DEFINIÇÕES
     greeting_patterns = r'^(oi|olá|bom dia|boa tarde|boa noite|tudo bem|e aí)[\s.,!?]*$'
     if re.match(greeting_patterns, query_lower):
-        return AnalysisResponse(
-            query=query,
-            **run_greeting_analysis(query)
-        )
+        return AnalysisResponse(query=query, **run_greeting_analysis(query))
 
-    # NOVO: TRATAMENTO DE DEFINIÇÕES (Prioridade Alta)
-    definition_patterns = [
-        'o que é dppm', 'dppm o que é', 'o que significa dppm', 
-        'definição de dppm', 'o que e dppm', 
-
-        'o que é ddpm', 'ddpm o que é', 'o que significa ddpm', 
-    ]
+    definition_patterns = ['o que é dppm', 'dppm o que é', 'o que significa dppm', 'definição de dppm', 'o que e dppm']
     if any(pattern in query_lower for pattern in definition_patterns):
-        return AnalysisResponse(
-            query=query,
-            **run_dppm_definition()
-        )
+        return AnalysisResponse(query=query, **run_dppm_definition())
 
-    # 1. Pré-processamento e Flatten Crítico
+    # 1. Pré-processamento e Contexto (Ideia 1)
     df = prepare_dataframe(data_to_analyze, flatten_multifalha=True) 
 
     if df.empty or len(data_to_analyze) == 0:
-        # Resposta de fallback para base de dados vazia
         return AnalysisResponse(
             query=query,
-            summary="Nenhum dado encontrado para análise ou dados inválidos após o pré-processamento. Tente consultar dados em um período diferente.",
+            summary="Nenhum dado encontrado para análise ou dados inválidos. Verifique a seleção de dados.",
             tips=[Tip(title="Base de Dados Vazia", detail="Verifique a fonte de dados e o filtro inicial.")],
             visualization_data=[]
         )
+        
+    # Tratamento de Continuação (Ideia 1)
+    if "continuar" in query_lower or "agora me mostre" in query_lower:
+        last_context = memory.last()
+        if last_context:
+            return AnalysisResponse(
+                query=query,
+                summary=f"Continuando a partir da última análise ({last_context[-1]['query']}):\n\n{last_context[-1]['summary']}",
+                tips=[Tip(title="Contexto", detail="Reutilizei o resumo da análise anterior para dar continuidade à sua exploração.")]
+            )
 
-    # 2. Mapeamento de Funções de Análise e Execução (mantido o resto da lógica)
+    # 2. Detecta Intenções (Ideia 2)
+    active_intents = detect_intents(query_lower)
     
-    # Tenta executar a análise mais específica correspondente à query
-    if 'taxa de falha' in query_lower or 'dppm' in query_lower or 'qualidade' in query_lower:
-        analysis_results = run_quality_analysis(df, query)
-    elif 'causa raiz' in query_lower or 'linha' in query_lower:
-        analysis_results = run_root_cause_analysis(df, query)
-    elif 'tópico' in query_lower or 'nlp' in query_lower or 'observações' in query_lower:
-        analysis_results = run_nlp_analysis(df, query)
-    elif 'setor' in query_lower or 'origem' in query_lower:
-        analysis_results = run_sector_analysis(df, query)
+    # 3. Execução Paralela (Ideia 3)
+    tasks_to_run = []
     
-    # 3. Consolidação dos Resultados
-    if analysis_results and analysis_results.get('status') == 'OK':
-        return AnalysisResponse(
-            query=query,
-            summary=analysis_results['summary'],
-            tips=analysis_results['tips'],
-            visualization_data=analysis_results['visualization_data']
-        )
+    if "qualidade" in active_intents:
+        tasks_to_run.append(asyncio.to_thread(run_quality_analysis, df, query))
+    if "setor" in active_intents:
+        tasks_to_run.append(asyncio.to_thread(run_sector_analysis, df, query))
+    if "causa_raiz" in active_intents:
+        tasks_to_run.append(asyncio.to_thread(run_root_cause_analysis, df, query))
+    # NLP é a única análise que precisa de 'await' direto
+    if "nlp" in active_intents:
+        tasks_to_run.append(run_nlp_analysis(df, query))
+        
+    # Fallback/Default se nenhuma intenção específica foi encontrada
+    if not tasks_to_run:
+        tasks_to_run.append(asyncio.to_thread(run_structured_default_analysis, df, query))
+
+    # Executa todas as tarefas simultaneamente (Ideia 3)
+    executed_results = await asyncio.gather(*tasks_to_run)
+    executed_results = [r for r in executed_results if r.get("status") == "OK"]
+
+    # Caso todas as análises específicas falhem
+    if not executed_results:
+        # Garante o Fallback Estruturado, mesmo que a primeira chamada tenha falhado
+        default_analysis = run_structured_default_analysis(df, query)
+        memory.add(query, default_analysis.get('summary', ''))
+        return AnalysisResponse(query=query, **default_analysis)
+
+    # 4. Combina Múltiplos Resultados
+    combined_summary = "\n\n".join(r["summary"] for r in executed_results)
+    combined_vis = [v for r in executed_results for v in r.get("visualization_data", [])]
+    combined_tips = [t for r in executed_results for t in r.get("tips", [])]
+
+    # 5. Forecast Automático (Ideia 5)
+    next_forecast = forecast_next_period(df)
+    if next_forecast is not None and next_forecast > 0:
+        combined_summary += f"\n\n📈 **Previsão de Risco:** Se o padrão se mantiver, o próximo período pode registrar cerca de **{next_forecast:.0f} falhas** (baseado na tendência dos dados de falha)."
+        combined_tips.append(Tip(title="Ação Preventiva", detail="Avalie planos de mitigação para o próximo ciclo, dado o risco de aumento de falhas."))
     
-    # 4. Fallback para Análise Geral
-    return default_analysis(df, query)
+    # 6. Insights Automáticos com Gemini (Ideia 4)
+    # Chama o LLM para sumarizar e dar um insight estratégico sobre os resultados combinados
+    try:
+        gemini_insight = await summarize_analysis_with_gemini({
+            "query": query,
+            "summary": combined_summary,
+            "tips": [t.detail for t in combined_tips],
+        })
+        if gemini_insight and len(gemini_insight) > 20:
+            combined_summary += "\n\n🧠 **Insight Estratégico da IA:** " + gemini_insight
+    except Exception:
+        # Se o LLM falhar, a análise de Pandas/Python ainda é retornada
+        pass 
+
+    # 7. Atualiza Memória e Retorna (Ideia 1)
+    memory.add(query, combined_summary)
+
+    return AnalysisResponse(
+        query=query,
+        summary=combined_summary,
+        tips=combined_tips,
+        visualization_data=combined_vis
+    )

@@ -1,3 +1,10 @@
+# main.py
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv() 
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional 
@@ -5,7 +12,6 @@ import models
 from database import engine
 from routers import auth, checklists, analysis, producao, user, auth_routes
 
-# Criação das tabelas no SQLite
 try:
     # A nova tabela RegistroProducao será criada aqui
     models.Base.metadata.create_all(bind=engine)

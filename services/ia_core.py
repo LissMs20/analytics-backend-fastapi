@@ -1,4 +1,5 @@
 # services/ia_core.py
+
 import json
 import joblib 
 import numpy as np
@@ -9,123 +10,74 @@ from typing import Dict, Any, List
 from datetime import datetime
 from functools import lru_cache
 
-# Importações de domínio do módulo de pré-processamento
+# A função 'preprocessing.classify_product_line' e 'CAUSA_RAIZ_MAP' 
+# devem ser acessíveis ou importadas do seu módulo 'preprocessing'.
 from .preprocessing import classify_product_line, CAUSA_RAIZ_MAP 
 
-# Configuração de logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Importação condicional do torch (para NLP)
-try:
-    import torch 
-    from transformers import pipeline
-    HAS_NLP = True
-except ImportError:
-    logger.warning("[IA] 'torch' e 'transformers' não instalados. Funções de NLP desativadas.")
-    torch = None
-    pipeline = None
-    HAS_NLP = False
+# ----------------------------------------------------
+# REMOVIDO: Importações de torch, transformers e HAS_NLP
+# ----------------------------------------------------
 
-# --- CONSTANTE DE LÓGICA DE REGRAS ---
+# --- LOGICA DE REGRA DE NEGÓCIO SIMULADA (MANTIDA) ---
 LOGICA_MODELO_SIMULADO = {
-    # (Falha, Setor): Recomendação
     ("QUEBRA DO PINO", "MONTAGEM MECÂNICA"): "Ajustar o torque da ferramenta pneumática (limite em 5Nm).",
     ("FALHA DE SOLDA", "SMT"): "Revisar o perfil de temperatura do forno e a pasta de solda utilizada.",
     ("CURTO CIRCUITO", "TESTE FUNCIONAL"): "Aumentar a inspeção visual na etapa SMT e verificar o alinhamento de componentes críticos.",
     ("FALHA DE COMPONENTE", "COMPRA/RECEBIMENTO"): "Notificar o fornecedor e solicitar análise de lote do componente X.",
 }
-# ---------------------------------------------------------------------
 
-# --- Configurações de Arquivo Scikit-learn ---
 MODEL_FILE = 'checklist_predictor_model.joblib'
 CLASSES_FILE = 'checklist_classes.json'
-# ---------------------------------------------
 
-# Variável global para o pipeline ML e classes
-ML_MODEL_PIPELINE = None # Variável global para armazenar o pipeline ML
+ML_MODEL_PIPELINE = None
 TIPOS_DE_FALHA = [] 
-topic_pipeline = None 
+
+# ----------------------------------------------------
+# REMOVIDO: topic_pipeline = None (Não é mais necessário)
+# ----------------------------------------------------
 
 @lru_cache(maxsize=1)
 def get_ml_model():
     """Carrega o modelo Scikit-learn, uma única vez na primeira chamada, e armazena em cache."""
-    global TIPOS_DE_FALHA, ML_MODEL_PIPELINE # Garante que estamos modificando a global
+    global TIPOS_DE_FALHA, ML_MODEL_PIPELINE 
     
     if ML_MODEL_PIPELINE is not None:
-        return ML_MODEL_PIPELINE # Retorna o cache se já estiver carregado
+        return ML_MODEL_PIPELINE 
 
     if os.path.exists(MODEL_FILE):
         try:
             model = joblib.load(MODEL_FILE)
             with open(CLASSES_FILE, 'r') as f:
-                # O TIPOS_DE_FALHA é carregado na primeira chamada
                 TIPOS_DE_FALHA = json.load(f) 
             
-            ML_MODEL_PIPELINE = model # 🚨 CORREÇÃO: Atribui o objeto carregado à global 🚨
+            ML_MODEL_PIPELINE = model 
             
             logger.info(f"[IA] Modelo Scikit-learn carregado LAZY. Classes: {len(TIPOS_DE_FALHA)}")
             return ML_MODEL_PIPELINE
         except Exception as e:
             logger.error(f"[IA] ERRO ao carregar Scikit-learn: {e}.")
-            ML_MODEL_PIPELINE = None # Garante que o estado é None em caso de falha
+            ML_MODEL_PIPELINE = None 
             return None
     logger.warning("[IA] AVISO: Modelo Scikit-learn não encontrado. Retornando None.")
     return None
 
-# --- FUNÇÃO MODIFICADA: Apenas carrega o NLP (Se o NLP não causar falha) ---
-def carregar_modelos_ia_nlp_only():
-    """Carrega APENAS o Transformer NLP, se houver."""
-    global topic_pipeline
-    
-    # 2. Carregar Modelo Transformer (Classificação de Tópico)
-    if HAS_NLP:
-        try:
-            device_id = 0 if torch.cuda.is_available() else -1
-            topic_pipeline = pipeline(
-                "zero-shot-classification", 
-                model="facebook/bart-large-mnli", 
-                device=device_id
-            )
-            logger.info(f"[IA] Modelo Transformer (Classificação Zero-Shot) carregado com sucesso (Device: {device_id}).")
-        except Exception as e:
-            logger.warning(f"[IA] AVISO: Falha ao carregar o Transformer: {e}")
-            topic_pipeline = None
-
-@lru_cache(maxsize=128)
-def classificar_observacao_topico(text: str) -> str:
-    """Classifica o tópico de uma observação usando o Transformer."""
-    global topic_pipeline
-    
-    TOPIC_LABELS = [
-        "Problema de Máquina", "Problema de Material/Componente", 
-        "Problema de Processo/Ajuste", "Erro Operacional/Humano", 
-        "Revisão (Sem Defeito / Inconclusivo)"
-    ]
-
-    # NLP só é útil para textos razoavelmente longos
-    if not topic_pipeline or not text or len(text.strip()) < 15:
-        return "N/A - Texto Curto/Modelo Indisponível"
-
-    try:
-        result = topic_pipeline(text, TOPIC_LABELS, multi_label=False)
-        return result.get('labels', ['N/A - Inferência Falhou'])[0]
-    except Exception as e:
-        logger.warning(f"[IA] Falha na inferência NLP: {e}")
-        return "ERRO - Inferência"
-
-# 🚨 CHAME APENAS O CARREGAMENTO DO NLP GLOBALMENTE 🚨
-carregar_modelos_ia_nlp_only() 
+# ----------------------------------------------------
+# REMOVIDO: carregar_modelos_ia_nlp_only()
+# REMOVIDO: classificar_observacao_topico(text: str) -> str
+# REMOVIDO: A chamada global 'carregar_modelos_ia_nlp_only()'
+# ----------------------------------------------------
 
 
 # --- LÓGICA DO MODELO (ANÁLISE EM TEMPO REAL) ---
 
 def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Executa todas as análises de domínio, regras e ML/NLP para um único registro de falha.
+    Executa todas as análises de domínio, regras e ML para um único registro de falha.
     Retorna um dicionário com os resultados.
     """
-    # 🚨 CORREÇÃO: Chama get_ml_model() para carregar/obter o pipeline 🚨
     model_pipeline = get_ml_model() 
     global TIPOS_DE_FALHA
     
@@ -133,15 +85,17 @@ def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
     falha = dados_checklist.get('falha', '').strip()
     setor = dados_checklist.get('setor', '').strip()
     produto = dados_checklist.get('produto', '').strip()
-    # Combina observações de forma robusta, caindo para string vazia
+    # Observação é combinada, mas a classificação do TÓPICO (NLP) NÃO É MAIS FEITA AQUI.
     obs_prod = dados_checklist.get('observacao_producao', '') if isinstance(dados_checklist.get('observacao_producao'), str) else ''
     obs_ass = dados_checklist.get('observacao_assistencia', '') if isinstance(dados_checklist.get('observacao_assistencia'), str) else ''
-    observacao = f"{obs_prod} {obs_ass}".strip()
+    observacao = f"{obs_prod} {obs_ass}".strip() # Mantida, mas não classificada por NLP local
     
-    # 2. Análise de Domínio e NLP
+    # 2. Análise de Domínio
     causa_raiz_sugerida = CAUSA_RAIZ_MAP.get(falha, 'Causa Indeterminada')
     linha_produto = classify_product_line(produto)
-    topico_ia = classificar_observacao_topico(observacao) 
+    
+    # 🚨 topico_ia é definido como N/A, pois a classificação local foi removida
+    topico_ia = "N/A - Gemini Analisa via Query" 
     
     mensagem_base = (
         f"**Causa Raiz Sugerida (Domínio):** {causa_raiz_sugerida}. "
@@ -153,14 +107,14 @@ def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp_analise": datetime.now().isoformat(),
         "causa_raiz_dominio": causa_raiz_sugerida,
         "linha_produto": linha_produto,
-        "topico_ia": topico_ia,
+        "topico_ia": topico_ia, 
         "status": "Análise de Domínio", # Default
         "mensagem": mensagem_base
     }
     
     # 3. Análise Baseada em Regras (Base de Conhecimento)
     chave = (falha, setor)
-    recomendacao_simulada = LOGICA_MODELO_SIMULADO.get(chave) # <--- AGORA USA A CONSTANTE LOCAL
+    recomendacao_simulada = LOGICA_MODELO_SIMULADO.get(chave)
     if recomendacao_simulada:
         resultado.update({
             "status": "Recomendação Encontrada (Base de Conhecimento)",
@@ -181,13 +135,8 @@ def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
                 'localizacao_componente': [dados_checklist.get('localizacao_componente', '')], 
                 'lado_placa': [dados_checklist.get('lado_placa', '')]
             }
-            # Aqui, o DataFrame tem 1 LINHA
             df_predict = pd.DataFrame.from_dict(data_for_df)
             
-            # O erro Length of values (11) does not match length of index (9) NÃO DEVE ocorrer aqui 
-            # se o DataFrame (df_predict) tiver 1 linha e o pipeline estiver esperando apenas 1 linha.
-            # Se o erro persistir, o problema é na estrutura do 'model_pipeline' (e.g., um Transformer/Encoder)
-            # que está gerando mais ou menos colunas do que o estimador final espera.
             probabilities = model_pipeline.predict_proba(df_predict)[0]
             predicted_index = np.argmax(probabilities)
             predicted_falha = TIPOS_DE_FALHA[predicted_index]
@@ -217,9 +166,7 @@ def analisar_checklist(dados_checklist: Dict[str, Any]) -> Dict[str, Any]:
 
 def analisar_checklist_multifalha(lista_de_falhas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Executa a análise de IA para uma lista de falhas (como em 'falhas_json').
-    
-    A rota /checklists usa essa função para analisar o campo 'falhas' em background.
+    Executa a análise de IA para uma lista de falhas. (Lógica de loop inalterada)
     """
     
     if not isinstance(lista_de_falhas, list) or not lista_de_falhas:
