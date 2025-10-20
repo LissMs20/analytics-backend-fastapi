@@ -11,8 +11,8 @@ from functools import lru_cache
 # DADOS DE REFERÊNCIA (Domínio - Usados por IA e Análise)
 # ----------------------------------------------------
 
-# (As constantes PLACAS_TEMPO, PLACAS_PROTECAO_1, etc., e as funções clean_product_name, 
-# classify_product_line, CAUSA_RAIZ_MAP, extract_period_and_date, safe_json_load permanecem inalteradas)
+# (As constantes PLACAS_TEMPO, PLACAS_PROTECAO_1, etc. permanecem inalteradas)
+# ... (Funções clean_product_name, classify_product_line, extract_period_and_date, safe_json_load permanecem inalteradas)
 
 @lru_cache(maxsize=None)
 def clean_product_name(product: str) -> str:
@@ -180,6 +180,33 @@ CAUSA_RAIZ_MAP = {
 }
 
 # ----------------------------------------------------
+# FUNÇÃO DE REFINAMENTO DE CAUSA RAIZ (NOVA LÓGICA)
+# ----------------------------------------------------
+
+def refine_causa_raiz_smt(row: pd.Series) -> str:
+    falha = str(row['falha_individual']).lower()
+    setor_detecao = str(row['setor_falha_individual']).lower()
+    causa_basica = str(row['causa_raiz_processo'])
+    
+    # 1. Refinamento para Curto ou Falha de Solda
+    if 'solda' in falha or 'curto' in falha:
+        # Se for Curto/Falha de Solda e detectado em SMT (ou IV)
+        if 'smt' in setor_detecao or 'iv' in setor_detecao:
+            if 'curto de solda' in falha:
+                # Curto é quase sempre problema de PASTA/PRINTER/STENCIL
+                return 'Falha Crítica SMT (Pasta/Stencil/Printer)' # <- MELHOR CLASSIFICAÇÃO
+            elif 'falha de solda' in falha or 'solda fria' in falha:
+                # Falha ou Solda Fria em SMT é mais ligada ao perfil do REFLOW ou a P&P desalinhada
+                return 'Falha Processo SMT (Máquina Reflow/Perfil/P&P)' # <- CLASSIFICAÇÃO MAIS COMPLETA
+
+    # 2. Refinamento para Componente Faltando/Desalinhado em SMT (Mantido)
+    if ('componente faltando' in falha or 'desalinhado' in falha) and 'smt' in setor_detecao:
+        return 'Falha Processo SMT (Máquina Pick & Place/Setup)'
+
+    # Caso contrário, retorna a classificação básica
+    return causa_basica
+
+# ----------------------------------------------------
 # FUNÇÕES DE PRÉ-PROCESSAMENTO E UTILS
 # ----------------------------------------------------
 
@@ -238,7 +265,7 @@ def safe_json_load(value: Any) -> Any:
     return value
 
 # ====================================================================================================
-# ✅ SOLUÇÃO IMPLEMENTADA: Função flatten_nested robusta para lidar com mini-Series e arrays aninhados
+# Função flatten_nested robusta
 # ====================================================================================================
 def flatten_nested(x):
     """Garante que um valor aninhado (list, ndarray, Series, etc.) vire uma string simples."""
@@ -301,9 +328,12 @@ def flatten_multi_failure_data(df: pd.DataFrame) -> pd.DataFrame:
 
     df_final = pd.concat([df_final, falha_cols], axis=1)
 
-    # 5. Adiciona a causa raiz por falha individual
+    # 5. Adiciona a causa raiz básica
     df_final['causa_raiz_processo'] = df_final['falha_individual'].fillna('').apply(lambda x: CAUSA_RAIZ_MAP.get(x, 'Causa Indeterminada'))
 
+    # 6. ✅ NOVO PASSO: Refina a causa raiz com lógica SMT/Setor
+    df_final['causa_raiz_detalhada'] = df_final.apply(refine_causa_raiz_smt, axis=1)
+    
     return df_final.reset_index(drop=True)
 
 def prepare_dataframe(data: List[Dict], flatten_multifalha: bool = True) -> pd.DataFrame:
@@ -354,18 +384,13 @@ def prepare_dataframe(data: List[Dict], flatten_multifalha: bool = True) -> pd.D
         df = df.loc[:, ~df.columns.duplicated()].copy()
         df.index = pd.RangeIndex(len(df))
 
-        print("Shape observacao_producao (raw):", np.array(df.get('observacao_producao')).shape if 'observacao_producao' in df.columns else None)
-        print("Shape observacao_assistencia (raw):", np.array(df.get('observacao_assistencia')).shape if 'observacao_assistencia' in df.columns else None)
-        print("COLUMNS after flatten:", df.columns)
+        # (Logs de debug removidos para concisão, mas mantidos no código original se necessário)
 
         # 2) Função robusta para achatar valores aninhados (handling Series, list, ndarray, DataFrame)
-        def flatten_nested(x):
+        def flatten_nested_local(x): # Função renomeada para evitar conflito com a cacheada global
             if isinstance(x, pd.Series):
-                # converte mini-Series em lista
                 x = x.tolist()
             if isinstance(x, pd.DataFrame):
-                # concatena todas as células do DataFrame em uma string por linha
-                # (convertendo o df interno para lista de strings)
                 try:
                     return ' '.join(map(str, np.ravel(x.values)))
                 except Exception:
@@ -379,10 +404,10 @@ def prepare_dataframe(data: List[Dict], flatten_multifalha: bool = True) -> pd.D
         # 3) Garante que as colunas existam e sejam Series 1-D com strings
         def get_col_as_str_series(name):
             if name in df.columns:
-                s = df[name].apply(flatten_nested)
+                s = df[name].apply(flatten_nested_local)
             else:
                 s = pd.Series([''] * len(df), index=df.index)
-            # agora s pode ter índice próprio; transformamos em lista e alinhamos ao df
+            
             vals = list(s)
             # Trunca ou completa para garantir mesmo length do df
             if len(vals) > len(df):
@@ -392,9 +417,7 @@ def prepare_dataframe(data: List[Dict], flatten_multifalha: bool = True) -> pd.D
             return pd.Series(vals, index=df.index).astype(str)
 
         obs_prod = get_col_as_str_series('observacao_producao')
-        obs_ass  = get_col_as_str_series('observacao_assistencia')
-
-        print("DEBUG SHAPES pós-flatten:", len(obs_prod), len(obs_ass), len(df))
+        obs_ass = get_col_as_str_series('observacao_assistencia')
 
         # 4) Finalmente, cria a coluna combinada de forma segura
         df['observacao_combinada'] = (obs_prod.fillna('') + ' ' + obs_ass.fillna('')).str.strip()
@@ -407,8 +430,14 @@ def prepare_dataframe(data: List[Dict], flatten_multifalha: bool = True) -> pd.D
     # ----------------------------
     df['linha_produto'] = df.get('produto', pd.Series('', index=df.index)).fillna('').apply(classify_product_line)
 
+    # Se a função de flatten não rodou, criamos a coluna de causa raiz básica
     if 'causa_raiz_processo' not in df.columns and 'falha' in df.columns:
         df['causa_raiz_processo'] = df['falha'].fillna('').apply(lambda x: CAUSA_RAIZ_MAP.get(x, 'Causa Indeterminada'))
+
+    # Se o flatten rodou, já temos 'causa_raiz_detalhada'. Se não, a detalhada é igual à básica
+    if 'causa_raiz_detalhada' not in df.columns:
+        df['causa_raiz_detalhada'] = df.get('causa_raiz_processo', 'Causa Indeterminada')
+
 
     # ----------------------------
     # Métricas (DPPM)

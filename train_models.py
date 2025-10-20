@@ -19,9 +19,7 @@ def create_initial_training_data():
     Cria um DataFrame inicial de treinamento com base nos dados fornecidos pelo usuário.
     Estes dados simulam os registros 'COMPLETO' do banco de dados.
     """
-    # Dados Categóricos Reais Fornecidos
     
-    # Produtos (Simplificados para a parte do nome que não é o código PXXXX)
     produtos_origem = [
         'PLACA MONTADA (SMD + PTH) 7370V21 RTM-07 MK 220VCA V01',
         'PLACA MONTADA (SMD + PTH) 7311V22 TCS MULTIESCALA',
